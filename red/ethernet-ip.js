@@ -181,7 +181,14 @@ module.exports = function (RED) {
         function onConnectError(err) {
             let errStr = err instanceof Error ? err.toString() : JSON.stringify(err);
             node.error(RED._("ethip.error.onconnect") + errStr, {});
-            onControllerEnd();
+            // Deliberately NOT calling onControllerEnd() here.
+            //
+            // onControllerEnd() nulls every tag value and tears the controller
+            // down. On a device that is powered off for part of every day — the
+            // Solarco encabulator loses its PLC outside first shift — that turns
+            // an expected, routine connect failure into a full teardown and
+            // reconnect cycle every few seconds. The reconnect timer below
+            // already handles retrying.
         }
 
         function onControllerError(err) {
@@ -210,12 +217,19 @@ module.exports = function (RED) {
             if(closing) {
                 destroyPLC();
                 return;
-            } else {
+            } else if (config.resetTagsOnDisconnect !== false) {
                 //reset tag values, in case we're dropping the connection because of a wrong value
                 node._plc.forEach((tag) => {
                     tag.value = null;
                 });
             }
+            // resetTagsOnDisconnect === false keeps the last known values across a
+            // disconnect. Necessary where the PLC is powered down on a schedule
+            // rather than only on fault: the Solarco encabulator's controller is
+            // switched off outside first shift, so nulling on every disconnect
+            // emits a null downstream each evening and each weekend — a null part
+            // count is worse than a stale one, because consumers cannot tell it
+            // apart from a real reading.
 
             //try to reconnect if failed to connect
             connectTimeoutTimer = setTimeout(connect, 5000);
@@ -295,7 +309,11 @@ module.exports = function (RED) {
             node._plc.on("close", onControllerClose);
             node._plc.on("error", onControllerError);
             node._plc.on("end", onControllerEnd);
-            node._plc.connect(config.address, Number(config.slot) || 0).then(onConnect).catch(onConnectError);
+            // Third argument is SETUP: false skips the Rockwell controller-properties
+            // fetch, which an Omron NJ/NX refuses with CIP status 0x08 and which
+            // nothing in this node consumes. Requires the forked ethernet-ip that
+            // exposes the parameter.
+            node._plc.connect(config.address, Number(config.slot) || 0, false).then(onConnect).catch(onConnectError);
         }
 
         node.on('close', onNodeClose);
