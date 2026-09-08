@@ -309,10 +309,14 @@ module.exports = function (RED) {
             node._plc.on("close", onControllerClose);
             node._plc.on("error", onControllerError);
             node._plc.on("end", onControllerEnd);
-            // Third argument is SETUP: false skips the Rockwell controller-properties
-            // fetch, which an Omron NJ/NX refuses with CIP status 0x08 and which
-            // nothing in this node consumes. Requires the forked ethernet-ip that
-            // exposes the parameter.
+            // Third argument is SETUP: false skips the controller-properties fetch
+            // on connect. Nothing in this node consumes those properties, so the
+            // round-trip is pure cost.
+            //
+            // Measured 8 Sep 2026: an Omron NJ501-1400 answers that fetch fine, so
+            // this is NOT working around a demonstrated failure — it is defensive
+            // cover for an unexplained failure a predecessor deployment hit, plus
+            // one fewer round-trip. Requires the forked ethernet-ip.
             node._plc.connect(config.address, Number(config.slot) || 0, false).then(onConnect).catch(onConnectError);
         }
 
