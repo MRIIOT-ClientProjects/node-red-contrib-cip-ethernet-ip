@@ -181,14 +181,19 @@ module.exports = function (RED) {
         function onConnectError(err) {
             let errStr = err instanceof Error ? err.toString() : JSON.stringify(err);
             node.error(RED._("ethip.error.onconnect") + errStr, {});
-            // Deliberately NOT calling onControllerEnd() here.
+            // Not calling onControllerEnd() here — no teardown, no tag reset — but a
+            // retry MUST still be scheduled.
             //
-            // onControllerEnd() nulls every tag value and tears the controller
-            // down. On a device that is powered off for part of every day — the
-            // Solarco encabulator loses its PLC outside first shift — that turns
-            // an expected, routine connect failure into a full teardown and
-            // reconnect cycle every few seconds. The reconnect timer below
-            // already handles retrying.
+            // onControllerEnd() is otherwise the only place a reconnect is scheduled,
+            // and it runs only on the socket's 'error'/'end' events. A connect that
+            // fails by TIMEOUT (a PLC with link but not yet answering — e.g. still
+            // booting) never emits those, so without this line the node stops
+            // retrying for good: disconnected, logging nothing, until Node-RED is
+            // restarted. Reproduced 15 Sep 2026 by detaching a test container from
+            // the network mid-session and reattaching it: no retry, no session.
+            // Power-off happened to be safe only because EHOSTUNREACH also fires
+            // the socket 'error' event.
+            scheduleReconnect();
         }
 
         function onControllerError(err) {
@@ -207,6 +212,15 @@ module.exports = function (RED) {
             onControllerError(err);
         }
 
+        function scheduleReconnect() {
+            // The single place a retry is scheduled. Clearing first means repeated
+            // failure signals for one attempt (socket 'error' + connect rejection)
+            // collapse into one timer instead of stacking.
+            if (closing) return;
+            clearTimeout(connectTimeoutTimer);
+            connectTimeoutTimer = setTimeout(connect, 5000);
+        }
+
         function onControllerEnd() {
             clearTimeout(connectTimeoutTimer);
             manageStatus('offline');
@@ -217,7 +231,7 @@ module.exports = function (RED) {
             if(closing) {
                 destroyPLC();
                 return;
-            } else if (config.resetTagsOnDisconnect !== false) {
+            } else if (config.resetTagsOnDisconnect !== false && node._plc) {
                 //reset tag values, in case we're dropping the connection because of a wrong value
                 node._plc.forEach((tag) => {
                     tag.value = null;
@@ -232,7 +246,7 @@ module.exports = function (RED) {
             // apart from a real reading.
 
             //try to reconnect if failed to connect
-            connectTimeoutTimer = setTimeout(connect, 5000);
+            scheduleReconnect();
         }
 
         function onControllerClose(err) {
@@ -304,11 +318,12 @@ module.exports = function (RED) {
             }
 
             connected = false;
-            node._plc = new Controller();
-            node._plc.removeListener("close", node._plc._handleCloseEvent);
-            node._plc.on("close", onControllerClose);
-            node._plc.on("error", onControllerError);
-            node._plc.on("end", onControllerEnd);
+            const plc = new Controller();
+            node._plc = plc;
+            plc.removeListener("close", plc._handleCloseEvent);
+            plc.on("close", onControllerClose);
+            plc.on("error", onControllerError);
+            plc.on("end", onControllerEnd);
             // Third argument is SETUP: false skips the controller-properties fetch
             // on connect. Nothing in this node consumes those properties, so the
             // round-trip is pure cost.
@@ -317,7 +332,14 @@ module.exports = function (RED) {
             // this is NOT working around a demonstrated failure — it is defensive
             // cover for an unexplained failure a predecessor deployment hit, plus
             // one fewer round-trip. Requires the forked ethernet-ip.
-            node._plc.connect(config.address, Number(config.slot) || 0, false).then(onConnect).catch(onConnectError);
+            //
+            // The settle handlers check the instance: destroyPLC() removes the socket
+            // listeners from a superseded controller but cannot cancel its pending
+            // connect promise. Without this guard a late TIMEOUT rejection from an old
+            // attempt would schedule a retry that tears down a newer, healthy session.
+            plc.connect(config.address, Number(config.slot) || 0, false)
+                .then(() => { if (node._plc === plc) onConnect(); })
+                .catch((err) => { if (node._plc === plc) onConnectError(err); });
         }
 
         node.on('close', onNodeClose);
