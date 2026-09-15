@@ -170,6 +170,11 @@ module.exports = function (RED) {
 
             connected = true;
 
+            if (outage) {
+                node.log(`PLC connection restored after ${formatDuration(Date.now() - outage.since)} (${outage.attempts} reconnect attempts)`);
+                outage = null;
+            }
+
             for (let t of tags.values()) {
                 node._plc.subscribe(t);
             }
@@ -179,8 +184,7 @@ module.exports = function (RED) {
         }
 
         function onConnectError(err) {
-            let errStr = err instanceof Error ? err.toString() : JSON.stringify(err);
-            node.error(RED._("ethip.error.onconnect") + errStr, {});
+            reportFailure(RED._("ethip.error.onconnect"), err);
             // Not calling onControllerEnd() here — no teardown, no tag reset — but a
             // retry MUST still be scheduled.
             //
@@ -197,8 +201,7 @@ module.exports = function (RED) {
         }
 
         function onControllerError(err) {
-            let errStr = err instanceof Error ? err.toString() : JSON.stringify(err);
-            node.error(RED._("ethip.error.onerror") + errStr, {});
+            reportFailure(RED._("ethip.error.onerror"), err);
             onControllerEnd();
         }
 
@@ -210,6 +213,48 @@ module.exports = function (RED) {
 
             //proceed to cleanup and reconnect
             onControllerError(err);
+        }
+
+        // Outage-transition logging. While the device is unreachable the node retries every
+        // few seconds, and logging every failed attempt at error level buried the one line that
+        // matters: a device powered off on a schedule (the Solarco PLC, ~16 h a day) produced
+        // ~22,000 error lines a day, a genuine outage looked identical to the nightly routine, and
+        // the volume rotated the log away within a day. So log transitions, not retries:
+        //   - the FIRST failure of an outage, at error level (a real outage is still an error);
+        //   - each DIFFERENT failure reason once per outage (the diagnostic that matters);
+        //   - an hourly "still unreachable" summary, so a long outage is visible in the log;
+        //   - recovery, at info level, with duration and attempt count.
+        // Retry scheduling is untouched; only what is written to the log changes.
+        const OUTAGE_SUMMARY_MS = 60 * 60 * 1000;
+        let outage = null;
+
+        function describe(err) {
+            return err instanceof Error ? err.toString() : JSON.stringify(err);
+        }
+
+        function formatDuration(ms) {
+            if (ms < 90000) return `${Math.round(ms / 1000)} s`;
+            const m = Math.round(ms / 60000);
+            return m < 60 ? `${m} min` : `${Math.floor(m / 60)} h ${m % 60} min`;
+        }
+
+        function reportFailure(prefix, err) {
+            if (closing) return;
+            const reason = describe(err);
+            const now = Date.now();
+            if (!outage) {
+                outage = { since: now, attempts: 0, reasons: new Set([reason]), lastSummary: now };
+                node.error(`${prefix}${reason} (retrying every 5 s; repeats suppressed until the connection is restored)`, {});
+                return;
+            }
+            if (!outage.reasons.has(reason) && outage.reasons.size < 10) {
+                outage.reasons.add(reason);
+                node.warn(`${prefix}${reason} (outage since ${new Date(outage.since).toISOString()})`);
+            }
+            if (now - outage.lastSummary >= OUTAGE_SUMMARY_MS) {
+                outage.lastSummary = now;
+                node.warn(`PLC still unreachable after ${formatDuration(now - outage.since)} (${outage.attempts} reconnect attempts)`);
+            }
         }
 
         function scheduleReconnect() {
@@ -253,7 +298,9 @@ module.exports = function (RED) {
             try {
                 node._plc._handleCloseEvent(err);
             } catch (e) {
-                node.error(`${RED._("ethip.error.onerror")} ${e.message}`, {});
+                // The library throws on close-after-error; the socket error itself has already
+                // been reported through onControllerError, so this is the same outage.
+                reportFailure(RED._("ethip.error.onerror"), e);
             }
         }
 
@@ -318,6 +365,7 @@ module.exports = function (RED) {
             }
 
             connected = false;
+            if (outage) outage.attempts++;
             const plc = new Controller();
             node._plc = plc;
             plc.removeListener("close", plc._handleCloseEvent);
