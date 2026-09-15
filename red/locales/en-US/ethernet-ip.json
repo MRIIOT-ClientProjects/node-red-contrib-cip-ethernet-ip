@@ -50,8 +50,8 @@
                     "export": "Export",
                     "import": "Import",
                     "global": "<Global>"
-                }
-
+                },
+                "resetTagsOnDisconnect": "Reset values on disconnect"
             },
             "status": {
                 "online": "online",
